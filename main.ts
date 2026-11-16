@@ -1,3 +1,4 @@
+// Renders a shockwave bursting through a ring of machinery, with shards, embers, stars and a core flash.
 // A shockwave tearing a ring of machinery apart from the inside.
 // Node 22+, standard library only. Run: MAKEFUN_OUTPUT_DIR=out node main.ts
 import fs from 'node:fs';
@@ -251,6 +252,7 @@ const STARS: number[] = [];
 
 // ---------------------------------------------------------------- radiance
 const bufR = new Float32Array(N), bufG = new Float32Array(N), bufB = new Float32Array(N);
+const MASK = new Float32Array(N);          // near-side rib occlusion, used to depth-sort debris
 const t0 = Date.now();
 const jit = [0.25, 0.75];
 const out = new Float32Array(3);
@@ -313,7 +315,17 @@ function radiance(px: number, py: number, o: Float32Array) {
     r += amp * 1.00; g += amp * 0.11; b += amp * 0.045;
   }
 
-  // ---- the machinery ring: an open rib cage, not a filled band
+  // ---- the detonation cavity: hot gas filling the volume the ring encloses.
+  // The ring must silhouette against this, so it is broad and brightest near the core.
+  {
+    const cav = Math.exp(-Math.max(0, dist - 90) / 300);
+    const tf = 0.48 + 0.72 * fbm(dxc * 0.0032 + 51, dyc * 0.0032 + 17, 3) +
+      0.24 * noise2(dxc * 0.011 + 3, dyc * 0.011 + 91);
+    const amp = cav * Math.max(0, tf) * 0.60 * (0.30 + 0.70 * LB);
+    r += amp * 1.00; g += amp * 0.44; b += amp * 0.17;
+  }
+
+  // ---- the machinery ring: solids in front of the glow, shaded, not glowing
   {
     const rx = px - RCX, ry = py - RCY;
     const lx = rx * RCOS + ry * RSIN;
@@ -321,73 +333,65 @@ function radiance(px: number, py: number, o: Float32Array) {
     const u = lx / RA, v = ly / RB;
     const q = Math.sqrt(u * u + v * v);
     lastMask = 0;
-    if (q > 0.44 && q < 1.14) {
+    if (q > 0.44 && q < 1.16) {
       const th = Math.atan2(v, u);
       const k = Math.round(th / DTH);
       const st = STRUTS[((k % NR) + NR) % NR];
-      // v>0 is the near limb of the tilted disc
-      const depth = 0.42 + 0.58 * clamp(0.5 + v * 2.4);
+      const depth = 0.46 + 0.54 * clamp(0.5 + v * 2.4);      // v>0 is the near limb
       const Rl = Math.max(70, Math.hypot(RA * Math.cos(th), RB * Math.sin(th)));
       const arcPx = wrapPi(th - st.th) * Rl;
       const w = st.wPx * depth;
-      // radial extent of the rib: inner radius to outer radius
       const qA = st.qLo, qB = st.qHi;
-      const inQ = sstep(qA - 0.012, qA + 0.010, q) * sstep(qB + 0.014, qB - 0.012, q);
-      // two rims: thin plates that carry the ellipse read
-      const rimOut = sstep(0.019, 0.005, Math.abs(q - 1.010)) * (0.55 + 0.45 * depth);
-      const rimIn = sstep(0.015, 0.004, Math.abs(q - 0.590)) * (0.55 + 0.45 * depth);
+      const inQ = sstep(qA - 0.014, qA + 0.012, q) * sstep(qB + 0.016, qB - 0.014, q);
+      const rimOut = sstep(0.021, 0.006, Math.abs(q - 1.010)) * (0.5 + 0.5 * depth);
+      const rimIn = sstep(0.017, 0.005, Math.abs(q - 0.588)) * (0.5 + 0.5 * depth);
 
-      let m = 0;
+      let m = 0, shade = 0;
       if (st.alive) {
         const shear = st.bent * sstep(qA, qB, q) * 7.0;
-        // ribs are narrow: the gaps between them are wider than the ribs
-        const body = sstep(w * 0.62, w * 0.46, Math.abs(arcPx - shear)) * inQ;
-        m = Math.max(body, rimOut * 0.80, rimIn * 0.62);
+        const c = arcPx - shear;
+        const body = sstep(w, w * 0.90, Math.abs(c)) * inQ;
+        m = Math.max(body, rimOut * 0.85, rimIn * 0.65);
+        // round-bar cross-section: bright crown, dark flanks, no flat fill
+        const cn = clamp(c / Math.max(1, w * 0.96), -1, 1);
+        shade = Math.sqrt(Math.max(0, 1 - cn * cn));
       } else {
-        // a raw stump left at one rim where the rib was torn away
         const qs = qA + st.stub * (qB - qA);
-        const stump = sstep(w * 0.85, w * 0.30, Math.abs(arcPx)) *
-          sstep(qA - 0.02, qA + 0.01, q) * sstep(qs + 0.01, qs - 0.02, q);
-        m = Math.max(rimOut * 0.28, rimIn * 0.18, stump * 0.9);
+        const stump = sstep(w * 0.80, w * 0.26, Math.abs(arcPx)) *
+          sstep(qA - 0.02, qA + 0.012, q) * sstep(qs + 0.012, qs - 0.02, q);
+        m = Math.max(rimOut * 0.30, rimIn * 0.20, stump * 0.92);
+        shade = 0.8;
       }
 
       if (m > 0.004) {
         lastMask = m;
-        const occ = m * 0.94;
+        // OPAQUE: kill what is behind, then put back only a dark metal value
+        const occ = m * 0.985;
         r *= 1 - occ; g *= 1 - occ; b *= 1 - occ;
         const fire = gden(px, py);
-        const brushed = 0.5 + 0.5 * noise2(px * 0.08, py * 0.11) + 0.34 * fbm(px * 0.019, py * 0.019, 2);
-        // cold steel plate: high enough value to hold its silhouette against the gas
-        const steel = (0.30 + 0.42 * brushed) * (0.62 + 0.38 * depth);
-        r += m * steel * 0.80;
-        g += m * steel * 1.00;
-        b += m * steel * 1.42;
-        // blast-facing face warms where the shock has washed over it
-        const warm = m * steel * clamp(fire * 1.4 + 0.25 * clamp(1.5 - dist / (R0 * 3.0)));
-        r += warm * 0.62; g += warm * 0.34; b += warm * 0.10;
-        // knurled seam across each rib so it reads as a built member
-        const seam = sstep(0.030, 0.0, Math.abs(q - (qA + 0.62 * (qB - qA)))) * inQ * m;
-        r += seam * 0.10; g += seam * 0.16; b += seam * 0.26;
-        // specular sheen along the rib's long edge
-        const spec = sstep(w * 0.34, 0.0, Math.abs(Math.abs(arcPx) - w * 0.46)) * inQ;
-        r += spec * (0.34 + 0.90 * fire);
-        g += spec * (0.42 + 0.86 * fire);
-        b += spec * (0.66 + 0.80 * fire);
-      }
-      if (st.alive) {
+        const grain = 0.5 + 0.5 * fbm(px * 0.02, py * 0.02, 2) + 0.3 * noise2(px * 0.09, py * 0.11);
+        // cold steel: dark on the shadow side, cool-grey on the lit crown
+        const steel = 0.016 + 0.100 * shade * (0.55 + 0.55 * grain);
+        r += m * steel * 0.62;
+        g += m * steel * 0.80;
+        b += m * steel * 1.28;
+        // the blast light rakes along the crown faces
+        const rake = m * shade * (0.05 + 0.34 * fire);
+        r += rake * 1.25; g += rake * 0.78; b += rake * 0.34;
+        // panel joint across each rib: proof it is built, not grown
+        const joint = sstep(0.016, 0.0, Math.abs(q - (qA + 0.66 * (qB - qA)))) * inQ * m;
+        r += joint * 0.055; g += joint * 0.085; b += joint * 0.15;
+        // hot rim: the blast-facing inner end and the two long edges
         const heatPick = clamp(1.5 - dist / (R0 * 3.0));
-        const hotK = (0.16 + 1.8 * heatPick) * Math.max(LB, 0.10) * st.heat;
-        // hot rim on the blast-facing end and edges of each rib
-        const inner = sstep(0.020 * depth, 0.002, Math.abs(q - qA)) *
-          sstep(w * 1.10, w * 0.28, Math.abs(arcPx));
-        const outer = sstep(0.016 * depth, 0.002, Math.abs(q - qB)) *
-          sstep(w * 0.95, w * 0.22, Math.abs(arcPx));
-        const side = sstep(w * 0.12, 0.0, Math.abs(Math.abs(arcPx) - w * 0.94)) * inQ;
-        const hot = (inner * 3.6 + outer * 2.4 + side * 0.6) * hotK * 2.7;
-        r += hot * 1.00; g += hot * (0.33 + 0.30 * heatPick); b += hot * (0.05 + 0.33 * heatPick);
-        const gl = Math.exp(-Math.abs(q - qA) / 0.026) *
-          sstep(w * 3.2, w * 0.24, Math.abs(arcPx)) * hotK * 0.42;
-        r += gl; g += gl * 0.21; b += gl * 0.055;
+        const hotK = (0.22 + 2.0 * heatPick) * Math.max(LB, 0.10) * st.heat;
+        const tipIn = sstep(0.019 * depth, 0.002, Math.abs(q - qA)) *
+          sstep(w * 1.05, w * 0.34, Math.abs(arcPx - st.bent * 4.0));
+        const edge = sstep(w * 0.13, 0.0, Math.abs(Math.abs(arcPx) - w * 0.96)) * inQ;
+        const hot = (tipIn * 4.0 + edge * 1.15) * hotK * 2.8;
+        r += hot * 1.00; g += hot * (0.36 + 0.30 * heatPick); b += hot * (0.05 + 0.34 * heatPick);
+        const gl = Math.exp(-Math.abs(q - qA) / 0.024) *
+          sstep(w * 3.4, w * 0.30, Math.abs(arcPx)) * hotK * 0.34;
+        r += gl; g += gl * 0.20; b += gl * 0.05;
       }
     }
   }
@@ -428,15 +432,16 @@ function radiance(px: number, py: number, o: Float32Array) {
 
 for (let y = 0; y < H; y++) {
   for (let x = 0; x < W; x++) {
-    let ar = 0, ag = 0, ab = 0;
+    let ar = 0, ag = 0, ab = 0, am = 0;
     for (let sy = 0; sy < SS; sy++) {
       for (let sx = 0; sx < SS; sx++) {
         radiance(x + jit[sx], y + jit[sy], out);
-        ar += out[0]; ag += out[1]; ab += out[2];
+        ar += out[0]; ag += out[1]; ab += out[2]; am += lastMask;
       }
     }
     const i = y * W + x;
     bufR[i] = ar / SPP; bufG[i] = ag / SPP; bufB[i] = ab / SPP;
+    MASK[i] = am / SPP;
   }
 }
 
@@ -462,11 +467,14 @@ function splat(list: Deb[], gain: number) {
         const tw = Math.max(0.32, d.w * (1 - t * 0.85));
         const lim = tw * 2.1;
         if (dd > lim * lim) continue;
+        // debris behind the near ribs is hidden by them
+        const i = y * W + x;
+        const occ = MASK[i];
+        if (occ > 0.25) continue;
         const trail = Math.exp(-dd / (tw * tw + 0.065)) * (1 - t * 0.60);
         const head = Math.exp(-dd / (d.w * d.w * 1.6 + 0.10));
         const k = (trail * 0.74 + head * 2.1) * gain * d.bright;
         const h = d.heat;
-        const i = y * W + x;
         bufR[i] += k * (0.66 + h * 0.56);
         bufG[i] += k * (0.10 + h * h * 0.74);
         bufB[i] += k * (0.02 + h * h * h * 0.44);
